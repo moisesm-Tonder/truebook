@@ -1,0 +1,26 @@
+# Environment variables
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node / React
+node_modules/
+Front/dist/
+
+# Uploads
+Backend/uploads/
+
+# IDE
+.claude/
+.vscode/
+*.DS_Store

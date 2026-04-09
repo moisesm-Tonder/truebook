@@ -1,0 +1,657 @@
+import io
+from collections import defaultdict
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+MONTHS_ES_UPPER = [
+    "ENERO",
+    "FEBRERO",
+    "MARZO",
+    "ABRIL",
+    "MAYO",
+    "JUNIO",
+    "JULIO",
+    "AGOSTO",
+    "SEPTIEMBRE",
+    "OCTUBRE",
+    "NOVIEMBRE",
+    "DICIEMBRE",
+]
+
+
+def _num(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _safe_str(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+    return str(value)
+
+
+def _parse_date(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _date_label(value: Any) -> str:
+    d = _parse_date(value)
+    if d:
+        return d.isoformat()
+    return _safe_str(value, "")
+
+
+def _month_name_upper(period_month: int) -> str:
+    idx = max(1, min(12, int(period_month))) - 1
+    return MONTHS_ES_UPPER[idx]
+
+
+def _styled_header_row(ws, row_idx: int, start_col: int, end_col: int):
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+
+def _autowidth(ws, max_width: int = 52):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(value))
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), max_width)
+
+
+def _save_workbook(wb: Workbook) -> bytes:
+    buff = io.BytesIO()
+    wb.save(buff)
+    return buff.getvalue()
+
+
+def _extract_fees_components(fees_result) -> Dict[str, Any]:
+    merchant_summary = fees_result.merchant_summary or []
+    daily_breakdown = fees_result.daily_breakdown or []
+    withdrawals_summary = fees_result.withdrawals_summary or []
+    refunds_summary = fees_result.refunds_summary or []
+    other_fees_summary = fees_result.other_fees_summary or []
+    return {
+        "merchant_summary": merchant_summary,
+        "daily_breakdown": daily_breakdown,
+        "withdrawals_summary": withdrawals_summary,
+        "refunds_summary": refunds_summary,
+        "other_fees_summary": other_fees_summary,
+    }
+
+
+def build_fees_export(process, fees_result) -> Tuple[str, bytes]:
+    period_text = f"{_month_name_upper(process.period_month)} {process.period_year}"
+    components = _extract_fees_components(fees_result)
+    merchant_summary = components["merchant_summary"]
+    daily_breakdown = components["daily_breakdown"]
+    withdrawals_summary = components["withdrawals_summary"]
+    refunds_summary = components["refunds_summary"]
+    other_fees_summary = components["other_fees_summary"]
+
+    wb = Workbook()
+    ws_detail = wb.active
+    ws_detail.title = "Detalle por Merchant"
+    ws_summary = wb.create_sheet("Resumen por Merchant")
+    ws_razon = wb.create_sheet("Resumen por Razon Social")
+    ws_daily = wb.create_sheet("Tonder Fees desglose diario")
+
+    # ---- Detalle por Merchant ----
+    ws_detail["A2"] = f"REPORTE DE FEES — {period_text}   |   DETALLE POR MERCHANT"
+    ws_detail["A3"] = (
+        f"Montos en MXN  |  UTC-6  |  01-{_month_name_upper(process.period_month)[:3].title()}-{process.period_year} "
+        f"00:00 → Fin de mes 23:59  |  Neto = Monto Procesado - Fee c/IVA"
+    )
+    detail_headers = [
+        "",
+        "Merchant",
+        "Concepto",
+        "Adquirente",
+        "# Eventos",
+        "Monto Procesado",
+        "Fee %",
+        "Fee Fijo",
+        "Total Fee s/IVA",
+        "IVA (16%)",
+        "Total c/IVA",
+        "Neto a Liquidar",
+    ]
+    ws_detail.append([])
+    ws_detail.append(detail_headers)
+    _styled_header_row(ws_detail, ws_detail.max_row, 1, len(detail_headers))
+
+    grouped_tx = defaultdict(lambda: {"events": 0, "amount": 0.0, "fee": 0.0})
+    merchant_name_map: Dict[str, str] = {}
+    for row in daily_breakdown:
+        merchant_id = _safe_str(row.get("merchant_id"), "unknown")
+        merchant_name = _safe_str(row.get("merchant_name"), merchant_id)
+        acquirer = _safe_str(row.get("acquirer"), "Operativa")
+        key = (merchant_id, merchant_name, f"{acquirer} - Operativa", acquirer)
+        grouped_tx[key]["events"] += 1
+        grouped_tx[key]["amount"] += _num(row.get("amount"))
+        grouped_tx[key]["fee"] += _num(row.get("fee_amount"))
+        merchant_name_map[merchant_id] = merchant_name
+
+    w_map = { _safe_str(w.get("merchant_id"), "unknown"): w for w in withdrawals_summary }
+    r_map = { _safe_str(r.get("merchant_id"), "unknown"): r for r in refunds_summary }
+
+    all_merchants = set(merchant_name_map.keys()) | set(w_map.keys()) | set(r_map.keys())
+    all_merchants |= { _safe_str(m.get("merchant_id"), "unknown") for m in merchant_summary }
+
+    for mid in sorted(all_merchants, key=lambda x: merchant_name_map.get(x, x)):
+        merchant_name = merchant_name_map.get(mid, mid)
+        ws_detail.append([None, merchant_name])
+
+        for (g_mid, _m_name, concept, acquirer), val in sorted(grouped_tx.items(), key=lambda x: (x[0][1], x[0][2])):
+            if g_mid != mid:
+                continue
+            amount = round(val["amount"], 6)
+            total_fee = round(val["fee"], 6)
+            fee_pct = round((total_fee / amount) if amount else 0.0, 6)
+            iva = round(total_fee * 0.16, 6)
+            total_c_iva = round(total_fee + iva, 6)
+            neto = round(amount - total_c_iva, 6)
+            ws_detail.append([
+                None,
+                None,
+                concept,
+                acquirer,
+                val["events"],
+                amount,
+                fee_pct,
+                0.0,
+                total_fee,
+                iva,
+                total_c_iva,
+                neto,
+            ])
+
+        if mid in w_map:
+            w = w_map[mid]
+            total_fee = round(_num(w.get("total_fee")), 6)
+            amount = round(_num(w.get("total_amount")), 6)
+            iva = round(total_fee * 0.16, 6)
+            ws_detail.append([
+                None,
+                None,
+                "Withdrawals",
+                "N/A",
+                int(_num(w.get("count"))),
+                amount if amount else "—",
+                round((total_fee / amount) if amount else 0.0, 6),
+                0.0,
+                total_fee,
+                iva,
+                round(total_fee + iva, 6),
+                "—",
+            ])
+
+        if mid in r_map:
+            r = r_map[mid]
+            total_fee = round(_num(r.get("total_fee")), 6)
+            amount = round(_num(r.get("total_amount")), 6)
+            iva = round(total_fee * 0.16, 6)
+            ws_detail.append([
+                None,
+                None,
+                "Autorefunds/Refunds",
+                "N/A",
+                int(_num(r.get("count"))),
+                amount if amount else "—",
+                round((total_fee / amount) if amount else 0.0, 6),
+                0.0,
+                total_fee,
+                iva,
+                round(total_fee + iva, 6),
+                "—",
+            ])
+
+    # ---- Resumen por Merchant ----
+    ws_summary["A2"] = f"RESUMEN DE FEES POR MERCHANT — {period_text}"
+    ws_summary["A3"] = "Montos en MXN  |  Neto = Monto Procesado - Fee c/IVA"
+    ws_summary.append([])
+    summary_headers = [
+        "",
+        "Merchant",
+        "Monto Procesado",
+        "Fees Transacc.",
+        "Other Fees",
+        "Settlement",
+        "Withdrawals",
+        "Autorefunds",
+        "Routing Fee",
+        "Total s/IVA",
+        "IVA (16%)",
+        "Total c/IVA",
+        "Neto a Liquidar",
+    ]
+    ws_summary.append(summary_headers)
+    _styled_header_row(ws_summary, ws_summary.max_row, 1, len(summary_headers))
+
+    other_by_mid = defaultdict(float)
+    settlement_by_mid = defaultdict(float)
+    routing_by_mid = defaultdict(float)
+    for item in other_fees_summary if isinstance(other_fees_summary, list) else []:
+        mid = _safe_str(item.get("merchant_id"), "unknown")
+        amount = _num(item.get("total_fee", item.get("amount", 0)))
+        concept = _safe_str(item.get("concept", item.get("type", "other"))).lower()
+        if "settlement" in concept:
+            settlement_by_mid[mid] += amount
+        elif "routing" in concept:
+            routing_by_mid[mid] += amount
+        else:
+            other_by_mid[mid] += amount
+
+    merchant_ids = [ _safe_str(m.get("merchant_id"), "unknown") for m in merchant_summary ]
+    merchant_rows = { _safe_str(m.get("merchant_id"), "unknown"): m for m in merchant_summary }
+    for mid in sorted(set(merchant_ids) | set(w_map.keys()) | set(r_map.keys())):
+        m = merchant_rows.get(mid, {})
+        name = _safe_str(m.get("merchant_name"), mid)
+        gross = round(_num(m.get("gross_amount")), 6)
+        tx_fee = round(_num(m.get("total_fee")), 6)
+        withdrawals = round(_num((w_map.get(mid) or {}).get("total_fee")), 6)
+        autorefunds = round(_num((r_map.get(mid) or {}).get("total_fee")), 6)
+        other_fees = round(other_by_mid[mid], 6)
+        settlement = round(settlement_by_mid[mid], 6)
+        routing = round(routing_by_mid[mid], 6)
+        total_s_iva = round(tx_fee + other_fees + settlement + withdrawals + autorefunds + routing, 6)
+        iva = round(total_s_iva * 0.16, 6)
+        total_c_iva = round(total_s_iva + iva, 6)
+        neto = round(gross - total_c_iva, 6) if gross else "—"
+        ws_summary.append([
+            None,
+            name,
+            gross,
+            tx_fee,
+            other_fees,
+            settlement,
+            withdrawals,
+            autorefunds,
+            routing if routing else "—",
+            total_s_iva,
+            iva,
+            total_c_iva,
+            neto,
+        ])
+
+    # ---- Resumen por Razon Social ----
+    ws_razon["A2"] = f"RESUMEN DE FEES POR RAZON SOCIAL — {period_text}"
+    ws_razon["A3"] = "Montos en MXN  |  Consolidado por razón social (placeholder por merchant)"
+    ws_razon.append([])
+    razon_headers = [
+        "",
+        "Razon Social",
+        "Merchants",
+        "Monto Procesado",
+        "Fees Transacc.",
+        "Other Fees",
+        "Settlement",
+        "Withdrawals",
+        "Routing Fee",
+        "Total s/IVA",
+        "IVA (16%)",
+        "Total c/IVA",
+        "Neto a Liquidar",
+    ]
+    ws_razon.append(razon_headers)
+    _styled_header_row(ws_razon, ws_razon.max_row, 1, len(razon_headers))
+
+    for row in ws_summary.iter_rows(min_row=6, values_only=True):
+        if not row or not row[1]:
+            continue
+        ws_razon.append([
+            None,
+            row[1],  # Razon Social (sin catálogo aún)
+            row[1],  # Merchants
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[8],
+            row[9],
+            row[10],
+            row[11],
+            row[12],
+        ])
+
+    # ---- Desglose diario ----
+    ws_daily["A1"] = (
+        f"TONDER — FEES {period_text} | DESGLOSE DIARIO | Montos en MXN | UTC-6 | "
+        f"01-{_month_name_upper(process.period_month)[:3].title()}-{process.period_year} → Fin de mes"
+    )
+    daily_headers = [
+        "Fecha",
+        "Merchant",
+        "Concepto / Operativa",
+        "# Eventos",
+        "Monto Procesado",
+        "Fee s/IVA",
+        "IVA (16%)",
+        "Total c/IVA",
+    ]
+    ws_daily.append(daily_headers)
+    _styled_header_row(ws_daily, 2, 1, len(daily_headers))
+
+    daily_grouped = defaultdict(lambda: {"events": 0, "amount": 0.0, "fee": 0.0})
+    for row in daily_breakdown:
+        d = _date_label(row.get("date"))
+        merchant = _safe_str(row.get("merchant_name"), _safe_str(row.get("merchant_id"), "unknown"))
+        acquirer = _safe_str(row.get("acquirer"), "Operativa")
+        concept = f"{acquirer}-Operativa"
+        key = (d, merchant, concept)
+        daily_grouped[key]["events"] += 1
+        daily_grouped[key]["amount"] += _num(row.get("amount"))
+        daily_grouped[key]["fee"] += _num(row.get("fee_amount"))
+
+    last_date = None
+    for (d, merchant, concept), val in sorted(daily_grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        if d != last_date:
+            pretty = d
+            parsed = _parse_date(d)
+            if parsed:
+                pretty = parsed.strftime("  %d/%m/%Y")
+            ws_daily.append([pretty])
+            last_date = d
+        fee = round(val["fee"], 6)
+        iva = round(fee * 0.16, 6)
+        ws_daily.append([
+            None,
+            merchant,
+            concept,
+            val["events"],
+            round(val["amount"], 6),
+            fee,
+            iva,
+            round(fee + iva, 6),
+        ])
+
+    for ws in [ws_detail, ws_summary, ws_razon, ws_daily]:
+        _autowidth(ws)
+
+    filename = f"FEES_{_month_name_upper(process.period_month)}_{process.period_year}_FINAL.xlsx"
+    return filename, _save_workbook(wb)
+
+
+def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
+    period_text = f"{_month_name_upper(process.period_month)} {process.period_year}"
+    daily_summary = kushki_result.daily_summary or []
+    merchant_detail = kushki_result.merchant_detail or []
+
+    wb = Workbook()
+    ws_daily = wb.active
+    ws_daily.title = "Resumen Diario"
+    ws_detail = wb.create_sheet("Detalle por Merchant")
+    ws_pivot = wb.create_sheet("Pivot por Merchant")
+
+    ws_daily["A1"] = f"KUSHKI — RESUMEN DIARIO DE LIQUIDACIONES · {period_text}"
+    daily_headers = [
+        "Fecha Liq.",
+        "# Txns",
+        "Monto Bruto",
+        "Comisión Kushki",
+        "IVA Kushki",
+        "RR Retenido",
+        "RR Liberado",
+        "Com. Tonder s/IVA",
+        "Ajustes",
+        "Depósito Neto (Abonar)",
+    ]
+    ws_daily.append(daily_headers)
+    _styled_header_row(ws_daily, 2, 1, len(daily_headers))
+
+    for row in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
+        gross = round(_num(row.get("gross_amount")), 6)
+        commission = round(_num(row.get("commission")), 6)
+        iva = round(commission * 0.16, 6)
+        rolling = round(_num(row.get("rolling_reserve")), 6)
+        net = round(_num(row.get("net_deposit")), 6)
+        ws_daily.append([
+            _date_label(row.get("date")),
+            int(_num(row.get("tx_count"))),
+            gross,
+            commission,
+            iva,
+            rolling,
+            0.0,
+            0.0,
+            0.0,
+            net,
+        ])
+
+    ws_detail["A1"] = f"KUSHKI — DETALLE POR MERCHANT · {period_text}"
+    detail_headers = [
+        "Fecha Liq.",
+        "Merchant",
+        "# Txns",
+        "Monto Bruto",
+        "Com. Kushki + IVA",
+        "Rolling Reserve",
+        "RR Liberado",
+        "Com. Tonder %",
+        "Depósito Neto Merchant",
+    ]
+    ws_detail.append(detail_headers)
+    _styled_header_row(ws_detail, 2, 1, len(detail_headers))
+
+    for row in sorted(merchant_detail, key=lambda r: _safe_str(r.get("merchant_name"), "")):
+        ws_detail.append([
+            f"{process.period_year}-{str(process.period_month).zfill(2)}",
+            _safe_str(row.get("merchant_name"), "unknown"),
+            int(_num(row.get("tx_count"))),
+            round(_num(row.get("gross_amount")), 6),
+            round(_num(row.get("commission")), 6),
+            round(_num(row.get("rolling_reserve")), 6),
+            0.0,
+            0.0,
+            round(_num(row.get("net_deposit")), 6),
+        ])
+
+    ws_pivot["A1"] = f"KUSHKI — ACUMULADO POR MERCHANT · {period_text}"
+    pivot_headers = ["Merchant", "# Txns", "Monto Bruto", "Com. Kushki + IVA", "Tasa Efectiva", "Depósito Neto"]
+    ws_pivot.append(pivot_headers)
+    _styled_header_row(ws_pivot, 2, 1, len(pivot_headers))
+
+    for row in sorted(merchant_detail, key=lambda r: _safe_str(r.get("merchant_name"), "")):
+        gross = round(_num(row.get("gross_amount")), 6)
+        commission = round(_num(row.get("commission")), 6)
+        tasa = round((commission / gross) if gross else 0.0, 12)
+        ws_pivot.append([
+            _safe_str(row.get("merchant_name"), "unknown"),
+            int(_num(row.get("tx_count"))),
+            gross,
+            commission,
+            tasa,
+            round(_num(row.get("net_deposit")), 6),
+        ])
+
+    for ws in [ws_daily, ws_detail, ws_pivot]:
+        _autowidth(ws)
+
+    filename = f"KUSHKI_{_month_name_upper(process.period_month)}_{process.period_year}_v3.xlsx"
+    return filename, _save_workbook(wb)
+
+
+def _infer_category(description: str, debit: float, credit: float) -> str:
+    d = (description or "").lower()
+    if "kushki" in d:
+        return "Kushki – Liquidación"
+    if "settlement" in d or ("stp" in d and debit > 0):
+        return "Settlement merchant"
+    if credit > 0:
+        return "Abonos"
+    if debit > 0:
+        return "Cargos"
+    return "Otros"
+
+
+def build_banregio_export(process, banregio_result, kushki_result, conciliation_results: List[Any]) -> Tuple[str, bytes]:
+    period_text = f"{_month_name_upper(process.period_month)} {process.period_year}"
+    movements = banregio_result.movements or []
+    summary = banregio_result.summary or {}
+    daily_summary = (kushki_result.daily_summary if kushki_result else []) or []
+
+    kvb = None
+    for c in conciliation_results or []:
+        if getattr(c, "conciliation_type", "") == "kushki_vs_banregio":
+            kvb = c
+            break
+
+    matched = (kvb.matched if kvb else []) or []
+    unmatched_kushki = (kvb.unmatched_kushki if kvb else []) or []
+    unmatched_banregio = (kvb.unmatched_banregio if kvb else []) or []
+    total_difference = _num(getattr(kvb, "total_difference", 0)) if kvb else 0.0
+
+    wb = Workbook()
+    ws_moves = wb.active
+    ws_moves.title = "MOVIMIENTOS"
+    ws_summary = wb.create_sheet("RESUMEN")
+    ws_cross = wb.create_sheet("CRUCE KUSHKI")
+
+    # ---- MOVIMIENTOS ----
+    ws_moves["A1"] = f"ESTADO DE CUENTA BANREGIO – {period_text}   |   TRES COMAS S.A.P.I. DE C.V.   |   Cta. 001-9"
+    ws_moves["A2"] = (
+        f"Total Abonos: ${_num(summary.get('total_credits')):,.2f}  |  "
+        f"Total Cargos: ${_num(summary.get('total_debits')):,.2f}  |  "
+        f"Neto: ${_num(summary.get('net')):,.2f}"
+    )
+    move_headers = ["DÍA", "FECHA", "TIPO", "CONCEPTO / CONTRAPARTE", "CATEGORÍA", "CARGOS (MXN)", "ABONOS (MXN)", "SALDO (MXN)"]
+    ws_moves.append(move_headers)
+    _styled_header_row(ws_moves, 3, 1, len(move_headers))
+
+    category_acc = defaultdict(lambda: {"debits": 0.0, "credits": 0.0, "count": 0})
+    running_balance = 0.0
+    for mv in movements:
+        d = _parse_date(mv.get("date"))
+        debit = round(_num(mv.get("debit")), 6)
+        credit = round(_num(mv.get("credit")), 6)
+        desc = _safe_str(mv.get("description"), "")
+        typ = _safe_str(mv.get("type"), "INT" if ("spei" in desc.lower() or "traspaso" in desc.lower()) else "")
+        category = _safe_str(mv.get("category"), _infer_category(desc, debit, credit))
+        running_balance += (credit - debit)
+        category_acc[category]["debits"] += debit
+        category_acc[category]["credits"] += credit
+        category_acc[category]["count"] += 1
+        ws_moves.append([
+            d.day if d else None,
+            d if d else _safe_str(mv.get("date"), ""),
+            typ,
+            desc,
+            category,
+            debit if debit > 0 else None,
+            credit if credit > 0 else None,
+            round(running_balance, 6),
+        ])
+
+    # ---- RESUMEN ----
+    ws_summary["A1"] = f"RESUMEN {period_text} – BANREGIO TRES COMAS"
+    summary_headers = ["CATEGORÍA", "TOTAL CARGOS", "TOTAL ABONOS", "# MOVS"]
+    ws_summary.append(summary_headers)
+    _styled_header_row(ws_summary, 2, 1, len(summary_headers))
+    for category, data in sorted(category_acc.items(), key=lambda x: x[0]):
+        ws_summary.append([
+            category,
+            round(data["debits"], 6) if data["debits"] else None,
+            round(data["credits"], 6) if data["credits"] else None,
+            data["count"],
+        ])
+
+    # ---- CRUCE KUSHKI ----
+    ws_cross["A1"] = f"CRUCE KUSHKI vs BANREGIO – LIQUIDACIONES {period_text}   |   TRES COMAS S.A.P.I. DE C.V."
+    total_expected = len([d for d in daily_summary if _num(d.get("net_deposit")) > 0])
+    total_matched = len(matched)
+    total_diff_rows = len(unmatched_kushki) + len(unmatched_banregio)
+    ws_cross["A2"] = (
+        f"{total_expected} depósitos esperados · {total_matched} conciliados · "
+        f"{total_diff_rows} diferencias · Diferencia total: ${total_difference:,.2f}"
+    )
+    cross_headers = [
+        "FECHA LIQ.",
+        "# TXNS",
+        "MONTO BRUTO",
+        "COM. KUSHKI + IVA",
+        "RR RETENIDO",
+        "RR LIBERADO",
+        "DEP. NETO KUSHKI",
+        "ABONO BANREGIO",
+        "DIFERENCIA",
+        "ESTADO",
+        None,
+        "RESUMEN DEL CRUCE",
+        None,
+    ]
+    ws_cross.append(cross_headers)
+    _styled_header_row(ws_cross, 3, 1, 10)
+    _styled_header_row(ws_cross, 3, 12, 13)
+
+    matched_by_date = { _date_label(m.get("date")): m for m in matched }
+    row_ptr = 4
+    for daily in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
+        kushki_amount = round(_num(daily.get("net_deposit")), 6)
+        if kushki_amount <= 0:
+            continue
+        date_key = _date_label(daily.get("date"))
+        m = matched_by_date.get(date_key)
+        banregio_amount = round(_num(m.get("banregio_amount")), 6) if m else 0.0
+        diff = round(abs(kushki_amount - banregio_amount), 6) if m else kushki_amount
+        ws_cross.append([
+            _parse_date(date_key) or date_key,
+            int(_num(daily.get("tx_count"))),
+            round(_num(daily.get("gross_amount")), 6),
+            round(_num(daily.get("commission")), 6),
+            round(_num(daily.get("rolling_reserve")), 6),
+            0.0,
+            kushki_amount,
+            banregio_amount if m else None,
+            diff if diff else None,
+            "✓ OK" if m and diff <= 0.01 else "⚠ Revisar",
+            None,
+            None,
+            None,
+        ])
+        row_ptr += 1
+
+    cross_total_kushki = round(sum(_num(d.get("net_deposit")) for d in daily_summary), 6)
+    cross_total_banregio = round(sum(_num(m.get("banregio_amount")) for m in matched), 6)
+    side_rows = [
+        ("Depósitos Kushki", cross_total_kushki),
+        ("Abonos Banregio", cross_total_banregio),
+        ("Diferencia total", round(abs(cross_total_kushki - cross_total_banregio), 6)),
+        ("Días conciliados", total_matched),
+        ("Días con diferencia", total_diff_rows),
+    ]
+    side_start = 4
+    for i, (label, value) in enumerate(side_rows):
+        ws_cross.cell(row=side_start + i, column=12, value=label)
+        ws_cross.cell(row=side_start + i, column=13, value=value)
+
+    for ws in [ws_moves, ws_summary, ws_cross]:
+        _autowidth(ws)
+
+    filename = f"BANREGIO_{_month_name_upper(process.period_month)}_{process.period_year}_CONCILIADO_v2.xlsx"
+    return filename, _save_workbook(wb)
