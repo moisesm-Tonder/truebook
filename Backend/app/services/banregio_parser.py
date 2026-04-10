@@ -14,25 +14,76 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_pdf(content: bytes) -> pd.DataFrame:
-    """Extract table data from Banregio PDF bank statement."""
+    """Extract movement rows from Banregio PDF bank statement using text extraction."""
     try:
         import pdfplumber
+
+        # Regex for a row starting with a date DD/MM/YYYY
+        DATE_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(.+)$')
+        # Regex to find monetary amounts like $ 1,234,567.89 or $1234567.89
+        AMOUNT_RE = re.compile(r'\$\s*([\d,]+\.\d{2})')
+
         rows = []
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    for row in table:
-                        if row:
-                            rows.append(row)
+                text = page.extract_text()
+                if not text:
+                    continue
+                for line in text.split('\n'):
+                    line = line.strip()
+                    m = DATE_RE.match(line)
+                    if not m:
+                        continue
+                    date = m.group(1)
+                    rest = m.group(2)
+
+                    # Extract all amounts from the line
+                    amounts = [float(a.replace(',', '')) for a in AMOUNT_RE.findall(rest)]
+
+                    # Banregio format: ... Cargos  Abonos  Saldo
+                    # A line has either a cargo, an abono, or both; saldo is always last
+                    cargo = 0.0
+                    abono = 0.0
+
+                    if len(amounts) >= 3:
+                        # cargo, abono, saldo
+                        cargo = amounts[0]
+                        abono = amounts[1]
+                    elif len(amounts) == 2:
+                        # either (cargo, saldo) or (abono, saldo)
+                        # Determine by position: look for $ sign occurrences
+                        # Use context: if "cargo" text position comes before "abono"
+                        # Simpler: check if the line contains patterns that suggest credit
+                        rest_clean = rest.upper()
+                        is_credit = any(kw in rest_clean for kw in [
+                            'PAGO CAP', 'PAGO INT', 'SPEI', 'INVERSION', 'ABONO',
+                            'VENTA DE', 'REEMBOLSO', 'BNET', 'NVIO', 'BANKAOOL',
+                            'FINCO PAY'
+                        ])
+                        if is_credit:
+                            abono = amounts[0]
+                        else:
+                            cargo = amounts[0]
+                    elif len(amounts) == 1:
+                        # Only saldo — skip
+                        continue
+
+                    # Strip description: remove amounts from rest
+                    desc = AMOUNT_RE.sub('', rest).strip()
+                    # Remove trailing/leading underscores and references
+                    desc = re.sub(r'\s{2,}', ' ', desc).strip()
+
+                    rows.append({
+                        'Fecha': date,
+                        'Descripcion': desc,
+                        'Cargos': cargo,
+                        'Abonos': abono,
+                    })
+
         if not rows:
             return pd.DataFrame()
+        return pd.DataFrame(rows)
 
-        # Use first non-empty row as header
-        header = rows[0]
-        data = rows[1:]
-        df = pd.DataFrame(data, columns=header)
-        return df
     except Exception as e:
         logger.error(f"PDF parse error: {e}")
         return pd.DataFrame()
@@ -76,17 +127,13 @@ def parse_banregio(content: bytes, filename: str) -> Dict[str, Any]:
 
     # Normalize columns
     df.columns = [str(c).strip() for c in df.columns]
-
-    # Try to identify date, description, debit, credit columns
     col_lower = {c.lower(): c for c in df.columns}
 
-    date_col = next((col_lower[k] for k in ["fecha", "date", "f. operacion"] if k in col_lower), df.columns[0] if len(df.columns) > 0 else None)
-    desc_col = next((col_lower[k] for k in ["descripcion", "concepto", "description", "referencia"] if k in col_lower), None)
-    debit_col = next((col_lower[k] for k in ["cargo", "debito", "debit"] if k in col_lower), None)
-    credit_col = next((col_lower[k] for k in ["abono", "credito", "credit", "deposito"] if k in col_lower), None)
-
-    # Column H (index 7) is the deposit reference column per the spec
-    deposit_col_name = df.columns[7] if len(df.columns) > 7 else credit_col
+    date_col  = next((col_lower[k] for k in ["fecha", "date", "f. operacion"] if k in col_lower), df.columns[0])
+    desc_col  = next((col_lower[k] for k in ["descripcion", "concepto", "description", "referencia"] if k in col_lower), None)
+    debit_col = next((col_lower[k] for k in ["cargos", "cargo", "debito", "debit"] if k in col_lower), None)
+    credit_col= next((col_lower[k] for k in ["abonos", "abono", "credito", "credit", "deposito"] if k in col_lower), None)
+    deposit_col_name = credit_col  # For Banregio the abono IS the deposit ref
 
     movements = []
     for _, row in df.iterrows():
