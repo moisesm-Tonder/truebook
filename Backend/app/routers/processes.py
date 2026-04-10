@@ -65,6 +65,28 @@ def get_process(process_id: int, db: Session = Depends(get_db), current_user: Us
     return proc
 
 
+@router.delete("/{process_id}")
+def delete_process(process_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    proc = db.query(AccountingProcess).filter(AccountingProcess.id == process_id).first()
+    if not proc:
+        raise HTTPException(status_code=404, detail="Process not found")
+    if proc.status == "running":
+        raise HTTPException(status_code=400, detail="No se puede eliminar un proceso en ejecución")
+    # Delete associated files from disk
+    files = db.query(UploadedFile).filter(UploadedFile.process_id == process_id).all()
+    for f in files:
+        try:
+            if os.path.exists(f.stored_path):
+                os.remove(f.stored_path)
+        except Exception:
+            pass
+    db.query(UploadedFile).filter(UploadedFile.process_id == process_id).delete()
+    db.query(ProcessLog).filter(ProcessLog.process_id == process_id).delete()
+    db.delete(proc)
+    db.commit()
+    return {"message": "Proceso eliminado"}
+
+
 @router.get("/{process_id}/progress", response_model=ProcessProgress)
 def get_progress(process_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     proc = db.query(AccountingProcess).filter(AccountingProcess.id == process_id).first()

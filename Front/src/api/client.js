@@ -37,6 +37,7 @@ export const processApi = {
   create: (data) => api.post('/processes/', data),
   run: (id) => api.post(`/processes/${id}/run`),
   progress: (id) => api.get(`/processes/${id}/progress`),
+  delete: (id) => api.delete(`/processes/${id}`),
 }
 
 // ── Files ───────────────────────────────────────────────────────────────────

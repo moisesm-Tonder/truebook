@@ -1,17 +1,28 @@
-import React from 'react'
+import React, { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { processApi } from '../api/client'
-import { Plus, Loader2 } from 'lucide-react'
+import { Plus, Loader2, Trash2 } from 'lucide-react'
 import StatusBadge from '../components/ui/StatusBadge'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
 
 export default function ProcessList() {
+  const qc = useQueryClient()
+  const [confirmId, setConfirmId] = useState(null)
+
   const { data: processes = [], isLoading } = useQuery({
     queryKey: ['processes'],
     queryFn: () => processApi.list().then(r => r.data),
     refetchInterval: 8_000,
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id) => processApi.delete(id),
+    onSuccess: () => {
+      qc.invalidateQueries(['processes'])
+      setConfirmId(null)
+    },
   })
 
   return (
@@ -78,9 +89,38 @@ export default function ProcessList() {
                     {format(new Date(p.created_at), 'dd/MM/yyyy HH:mm', { locale: es })}
                   </td>
                   <td className="px-5 py-3">
-                    <Link to={`/processes/${p.id}`} className="text-brand-400 hover:text-brand-300 text-xs font-medium">
-                      Abrir →
-                    </Link>
+                    <div className="flex items-center gap-3">
+                      <Link to={`/processes/${p.id}`} className="text-brand-400 hover:text-brand-300 text-xs font-medium">
+                        Abrir →
+                      </Link>
+                      {p.status !== 'running' && (
+                        confirmId === p.id ? (
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => deleteMutation.mutate(p.id)}
+                              disabled={deleteMutation.isPending}
+                              className="text-xs text-red-400 hover:text-red-300 font-medium"
+                            >
+                              {deleteMutation.isPending ? <Loader2 size={12} className="animate-spin" /> : 'Confirmar'}
+                            </button>
+                            <span className="text-slate-700">·</span>
+                            <button
+                              onClick={() => setConfirmId(null)}
+                              className="text-xs text-slate-500 hover:text-slate-400"
+                            >
+                              Cancelar
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmId(p.id)}
+                            className="text-slate-600 hover:text-red-400 transition-colors"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
