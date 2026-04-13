@@ -428,8 +428,17 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
     for row in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
         gross = round(_num(row.get("gross_amount")), 6)
         commission = round(_num(row.get("commission")), 6)
-        iva = round(commission * 0.16, 6)
+        iva = round(_num(row.get("iva_kushki_commission")) or commission * 0.16, 6)
         rolling = round(_num(row.get("rolling_reserve")), 6)
+        rr_retained = round(_num(row.get("rr_retained")), 6)
+        rr_released = round(_num(row.get("rr_released")), 6)
+        if rr_retained == 0 and rr_released == 0 and rolling != 0:
+            if rolling > 0:
+                rr_retained = rolling
+            else:
+                rr_released = abs(rolling)
+        tonder_commission = round(_num(row.get("tonder_commission")), 6)
+        adjustments = round(_num(row.get("adjustments")), 6)
         net = round(_num(row.get("net_deposit")), 6)
         ws_daily.append([
             _date_label(row.get("date")),
@@ -437,10 +446,10 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
             gross,
             commission,
             iva,
-            rolling,
-            0.0,
-            0.0,
-            0.0,
+            rr_retained,
+            rr_released,
+            tonder_commission,
+            adjustments,
             net,
         ])
 
@@ -459,16 +468,24 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
     ws_detail.append(detail_headers)
     _styled_header_row(ws_detail, 2, 1, len(detail_headers))
 
-    for row in sorted(merchant_detail, key=lambda r: _safe_str(r.get("merchant_name"), "")):
+    for row in sorted(merchant_detail, key=lambda r: (_date_label(r.get("date")), _safe_str(r.get("merchant_name"), ""))):
+        rolling = round(_num(row.get("rolling_reserve")), 6)
+        rr_retained = round(_num(row.get("rr_retained")), 6)
+        rr_released = round(_num(row.get("rr_released")), 6)
+        if rr_retained == 0 and rr_released == 0 and rolling != 0:
+            if rolling > 0:
+                rr_retained = rolling
+            else:
+                rr_released = abs(rolling)
         ws_detail.append([
-            f"{process.period_year}-{str(process.period_month).zfill(2)}",
+            _date_label(row.get("date")) or f"{process.period_year}-{str(process.period_month).zfill(2)}",
             _safe_str(row.get("merchant_name"), "unknown"),
             int(_num(row.get("tx_count"))),
             round(_num(row.get("gross_amount")), 6),
             round(_num(row.get("commission")), 6),
-            round(_num(row.get("rolling_reserve")), 6),
-            0.0,
-            0.0,
+            rr_retained,
+            rr_released,
+            round(_num(row.get("tonder_commission")), 6),
             round(_num(row.get("net_deposit")), 6),
         ])
 
@@ -477,12 +494,20 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
     ws_pivot.append(pivot_headers)
     _styled_header_row(ws_pivot, 2, 1, len(pivot_headers))
 
-    for row in sorted(merchant_detail, key=lambda r: _safe_str(r.get("merchant_name"), "")):
+    pivot_acc = defaultdict(lambda: {"tx_count": 0.0, "gross_amount": 0.0, "commission": 0.0, "net_deposit": 0.0})
+    for row in merchant_detail:
+        merchant = _safe_str(row.get("merchant_name"), "unknown")
+        pivot_acc[merchant]["tx_count"] += _num(row.get("tx_count"))
+        pivot_acc[merchant]["gross_amount"] += _num(row.get("gross_amount"))
+        pivot_acc[merchant]["commission"] += _num(row.get("commission"))
+        pivot_acc[merchant]["net_deposit"] += _num(row.get("net_deposit"))
+
+    for merchant, row in sorted(pivot_acc.items(), key=lambda x: x[0].lower()):
         gross = round(_num(row.get("gross_amount")), 6)
         commission = round(_num(row.get("commission")), 6)
         tasa = round((commission / gross) if gross else 0.0, 12)
         ws_pivot.append([
-            _safe_str(row.get("merchant_name"), "unknown"),
+            merchant,
             int(_num(row.get("tx_count"))),
             gross,
             commission,
@@ -497,12 +522,20 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
     return filename, _save_workbook(wb)
 
 
-def _infer_category(description: str, debit: float, credit: float) -> str:
+def _amount_key(value: Any) -> int:
+    return int(round(_num(value) * 100, 0))
+
+
+def _infer_category(description: str, debit: float, credit: float, is_kushki_credit: bool = False) -> str:
     d = (description or "").lower()
-    if "kushki" in d:
-        return "Kushki – Liquidación"
+    if is_kushki_credit or "kushki" in d:
+        return "Kushki - Liquidacion"
     if "settlement" in d or ("stp" in d and debit > 0):
         return "Settlement merchant"
+    if "spei" in d and credit > 0:
+        return "Abonos SPEI"
+    if "spei" in d and debit > 0:
+        return "Cargos SPEI"
     if credit > 0:
         return "Abonos"
     if debit > 0:
@@ -523,9 +556,31 @@ def build_banregio_export(process, banregio_result, kushki_result, conciliation_
             break
 
     matched = (kvb.matched if kvb else []) or []
-    unmatched_kushki = (kvb.unmatched_kushki if kvb else []) or []
+    kvb_differences = (kvb.differences if kvb else []) or []
     unmatched_banregio = (kvb.unmatched_banregio if kvb else []) or []
     total_difference = _num(getattr(kvb, "total_difference", 0)) if kvb else 0.0
+
+    # Lookup to identify Banregio credits related to Kushki deposits.
+    kushki_credit_by_date = defaultdict(set)
+    kushki_credit_any_date = set()
+    for row in daily_summary:
+        amount = _num(row.get("net_deposit"))
+        if amount <= 0:
+            continue
+        date_key = _date_label(row.get("date"))
+        amount_key = _amount_key(amount)
+        if date_key:
+            kushki_credit_by_date[date_key].add(amount_key)
+        kushki_credit_any_date.add(amount_key)
+    for row in (matched + kvb_differences):
+        amount = _num(row.get("banregio_amount"))
+        if amount <= 0:
+            continue
+        date_key = _date_label(row.get("banregio_date") or row.get("date"))
+        amount_key = _amount_key(amount)
+        if date_key:
+            kushki_credit_by_date[date_key].add(amount_key)
+        kushki_credit_any_date.add(amount_key)
 
     wb = Workbook()
     ws_moves = wb.active
@@ -552,7 +607,22 @@ def build_banregio_export(process, banregio_result, kushki_result, conciliation_
         credit = round(_num(mv.get("credit")), 6)
         desc = _safe_str(mv.get("description"), "")
         typ = _safe_str(mv.get("type"), "INT" if ("spei" in desc.lower() or "traspaso" in desc.lower()) else "")
-        category = _safe_str(mv.get("category"), _infer_category(desc, debit, credit))
+        date_key = _date_label(mv.get("date"))
+        credit_key = _amount_key(credit)
+        desc_lower = desc.lower()
+        is_kushki_credit = (
+            credit > 0
+            and (
+                "kushki" in desc_lower
+                or (date_key and credit_key in kushki_credit_by_date.get(date_key, set()))
+                or credit_key in kushki_credit_any_date
+            )
+        )
+        category = _safe_str(mv.get("category"), "").strip()
+        if is_kushki_credit:
+            category = "Kushki - Liquidacion"
+        elif not category:
+            category = _infer_category(desc, debit, credit, is_kushki_credit=False)
         running_balance += (credit - debit)
         category_acc[category]["debits"] += debit
         category_acc[category]["credits"] += credit
@@ -585,7 +655,7 @@ def build_banregio_export(process, banregio_result, kushki_result, conciliation_
     ws_cross["A1"] = f"CRUCE KUSHKI vs BANREGIO – LIQUIDACIONES {period_text}   |   TRES COMAS S.A.P.I. DE C.V."
     total_expected = len([d for d in daily_summary if _num(d.get("net_deposit")) > 0])
     total_matched = len(matched)
-    total_diff_rows = len(unmatched_kushki) + len(unmatched_banregio)
+    total_diff_rows = len(kvb_differences) + len(unmatched_banregio)
     ws_cross["A2"] = (
         f"{total_expected} depósitos esperados · {total_matched} conciliados · "
         f"{total_diff_rows} diferencias · Diferencia total: ${total_difference:,.2f}"
@@ -609,41 +679,69 @@ def build_banregio_export(process, banregio_result, kushki_result, conciliation_
     _styled_header_row(ws_cross, 3, 1, 10)
     _styled_header_row(ws_cross, 3, 12, 13)
 
-    matched_by_date = { _date_label(m.get("date")): m for m in matched }
-    row_ptr = 4
+    cross_match_by_date: Dict[str, Dict[str, Any]] = {}
+    for row in (matched + kvb_differences):
+        date_key = _date_label(row.get("date"))
+        if not date_key:
+            continue
+        candidate = {
+            "banregio_amount": round(_num(row.get("banregio_amount")), 6),
+            "banregio_date": _date_label(row.get("banregio_date")),
+            "difference": round(_num(row.get("difference")), 6),
+        }
+        current = cross_match_by_date.get(date_key)
+        if current is None or candidate["difference"] < current["difference"]:
+            cross_match_by_date[date_key] = candidate
+
+    cross_rows = []
     for daily in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
         kushki_amount = round(_num(daily.get("net_deposit")), 6)
         if kushki_amount <= 0:
             continue
         date_key = _date_label(daily.get("date"))
-        m = matched_by_date.get(date_key)
-        banregio_amount = round(_num(m.get("banregio_amount")), 6) if m else 0.0
-        diff = round(abs(kushki_amount - banregio_amount), 6) if m else kushki_amount
+        matched_row = cross_match_by_date.get(date_key)
+        banregio_amount = round(_num((matched_row or {}).get("banregio_amount")), 6)
+        diff = round(abs(kushki_amount - banregio_amount), 6) if banregio_amount > 0 else kushki_amount
+        status = "OK" if banregio_amount > 0 and diff <= 0.01 else "Revisar"
+        rr_retained = round(_num(daily.get("rr_retained")), 6)
+        rr_released = round(_num(daily.get("rr_released")), 6)
+        rolling = round(_num(daily.get("rolling_reserve")), 6)
+        if rr_retained == 0 and rr_released == 0 and rolling != 0:
+            if rolling > 0:
+                rr_retained = rolling
+            else:
+                rr_released = abs(rolling)
         ws_cross.append([
             _parse_date(date_key) or date_key,
             int(_num(daily.get("tx_count"))),
             round(_num(daily.get("gross_amount")), 6),
             round(_num(daily.get("commission")), 6),
-            round(_num(daily.get("rolling_reserve")), 6),
-            0.0,
+            rr_retained,
+            rr_released,
             kushki_amount,
-            banregio_amount if m else None,
+            banregio_amount if banregio_amount > 0 else None,
             diff if diff else None,
-            "✓ OK" if m and diff <= 0.01 else "⚠ Revisar",
+            status,
             None,
             None,
             None,
         ])
-        row_ptr += 1
+        cross_rows.append({
+            "kushki_amount": kushki_amount,
+            "banregio_amount": banregio_amount,
+            "difference": diff,
+            "status": status,
+        })
 
-    cross_total_kushki = round(sum(_num(d.get("net_deposit")) for d in daily_summary), 6)
-    cross_total_banregio = round(sum(_num(m.get("banregio_amount")) for m in matched), 6)
+    cross_total_kushki = round(sum(r["kushki_amount"] for r in cross_rows), 6)
+    cross_total_banregio = round(sum(r["banregio_amount"] for r in cross_rows), 6)
+    cross_days_with_diff = sum(1 for r in cross_rows if r["difference"] > 0.01)
     side_rows = [
         ("Depósitos Kushki", cross_total_kushki),
         ("Abonos Banregio", cross_total_banregio),
         ("Diferencia total", round(abs(cross_total_kushki - cross_total_banregio), 6)),
         ("Días conciliados", total_matched),
-        ("Días con diferencia", total_diff_rows),
+        ("Días con diferencia", cross_days_with_diff),
     ]
     side_start = 4
     for i, (label, value) in enumerate(side_rows):

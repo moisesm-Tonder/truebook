@@ -228,6 +228,9 @@ def _run_full_process(process_id: int):
                     db.commit()
 
                     downloaded = kushki_sftp.download_month_files(year, month, sftp_dir)
+                    # Persist files in small batches to avoid oversized INSERT ... VALUES payloads.
+                    batch_size = 5
+                    pending = 0
                     for item in downloaded:
                         db.add(UploadedFile(
                             process_id=process_id,
@@ -237,9 +240,15 @@ def _run_full_process(process_id: int):
                             file_size=item.size,
                             status="uploaded",
                         ))
-                    db.commit()
+                        pending += 1
+                        if pending >= batch_size:
+                            db.commit()
+                            pending = 0
+                    if pending:
+                        db.commit()
                     _log(db, process_id, "kushki_sftp", f"SFTP Kushki: {len(downloaded)} archivo(s) descargado(s)")
                 except Exception as e:
+                    db.rollback()
                     _log(db, process_id, "kushki_sftp", f"Error en descarga SFTP Kushki: {e}", "warning")
             else:
                 _log(
@@ -323,9 +332,14 @@ def _run_full_process(process_id: int):
             db.commit()
 
             total_credits = sum(m.get("credit", 0) for m in all_movements)
+            total_debits = sum(m.get("debit", 0) for m in all_movements)
             banregio_data = {
                 "movements": all_movements,
-                "summary": {"total_credits": round(total_credits, 6)},
+                "summary": {
+                    "total_credits": round(total_credits, 6),
+                    "total_debits": round(total_debits, 6),
+                    "net": round(total_credits - total_debits, 6),
+                },
                 "deposit_column": all_deposits,
             }
             existing = db.query(BanregioResult).filter(BanregioResult.process_id == process_id).first()
