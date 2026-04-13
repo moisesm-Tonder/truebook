@@ -59,9 +59,11 @@ COLUMN_MAP = {
     "gross_amount": "gross_amount",
     "suma de approved_transaction_amount": "gross_amount",
     "comision": "commission",
-    "comision kushki": "commission",
+    "comision kushki": "kushki_commission",
+    "comision kushki s/iva": "kushki_commission",
     "comision kushki + iva": "commission",
     "com. kushki + iva": "commission",
+    "com. kushki": "kushki_commission",
     "commission": "commission",
     "fee": "commission",
     "suma de kushki_commission": "kushki_commission",
@@ -278,6 +280,8 @@ def _prepare_kushki_df(df: pd.DataFrame) -> pd.DataFrame:
         "tx_count": 0.0,
         "gross_amount": 0.0,
         "commission": 0.0,
+        "kushki_commission": 0.0,
+        "iva_kushki_commission": 0.0,
         "rr_retained": 0.0,
         "rr_released": 0.0,
         "tonder_commission": 0.0,
@@ -298,17 +302,32 @@ def _prepare_kushki_df(df: pd.DataFrame) -> pd.DataFrame:
         if (not had_rr_released) or rr_released_current.abs().sum() == 0:
             df["rr_released"] = (-roll).clip(lower=0)
 
-    # Derive commission if only component fields exist.
-    commission_sum = pd.to_numeric(df.get("commission", 0), errors="coerce").fillna(0).sum()
-    if commission_sum == 0:
-        kushki_comm = pd.to_numeric(df.get("kushki_commission", 0), errors="coerce").fillna(0)
-        iva_comm = pd.to_numeric(df.get("iva_kushki_commission", 0), errors="coerce").fillna(0)
-        df["commission"] = kushki_comm + iva_comm
+    # Keep commission split explicit (commission without IVA + IVA), and derive total when needed.
+    commission = pd.to_numeric(df.get("commission", 0), errors="coerce").fillna(0.0)
+    kushki_comm = pd.to_numeric(df.get("kushki_commission", 0), errors="coerce").fillna(0.0)
+    iva_comm = pd.to_numeric(df.get("iva_kushki_commission", 0), errors="coerce").fillna(0.0)
+
+    if commission.abs().sum() == 0:
+        commission = kushki_comm + iva_comm
+
+    missing_kushki_comm = kushki_comm == 0
+    derived_kushki_comm = (commission - iva_comm).where(iva_comm != 0, commission / 1.16)
+    kushki_comm = kushki_comm.where(~missing_kushki_comm, derived_kushki_comm)
+
+    missing_iva = iva_comm == 0
+    derived_iva = (commission - kushki_comm).clip(lower=0)
+    iva_comm = iva_comm.where(~missing_iva, derived_iva)
+
+    df["commission"] = commission
+    df["kushki_commission"] = kushki_comm
+    df["iva_kushki_commission"] = iva_comm
 
     numeric_cols = [
         "tx_count",
         "gross_amount",
         "commission",
+        "kushki_commission",
+        "iva_kushki_commission",
         "rr_retained",
         "rr_released",
         "tonder_commission",
@@ -342,7 +361,9 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
     # TONDER rows represent released rolling reserve and should not show in merchant detail.
     merchant_norm = df["merchant_name"].map(_norm_text)
     is_tonder = merchant_norm == "tonder"
-    df["rr_released_total"] = df["rr_released"] + (is_tonder.astype(float) * df["net_deposit"])
+    tonder_release = is_tonder.astype(float) * df["net_deposit"]
+    # Some source files already include RR liberado; only fallback to TONDER net when RR is missing.
+    df["rr_released_total"] = df["rr_released"].where(df["rr_released"] != 0, tonder_release)
     df["rolling_reserve"] = df["rr_retained"] - df["rr_released_total"]
 
     daily = (
@@ -351,6 +372,8 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
             tx_count=("tx_count", "sum"),
             gross_amount=("gross_amount", "sum"),
             commission=("commission", "sum"),
+            kushki_commission=("kushki_commission", "sum"),
+            iva_kushki_commission=("iva_kushki_commission", "sum"),
             rr_retained=("rr_retained", "sum"),
             rr_released=("rr_released_total", "sum"),
             tonder_commission=("tonder_commission", "sum"),
@@ -367,6 +390,8 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
             "tx_count": int(round(float(row["tx_count"]), 0)),
             "gross_amount": round(float(row["gross_amount"]), 6),
             "commission": round(float(row["commission"]), 6),
+            "kushki_commission": round(float(row["kushki_commission"]), 6),
+            "iva_kushki_commission": round(float(row["iva_kushki_commission"]), 6),
             "rr_retained": round(float(row["rr_retained"]), 6),
             "rr_released": round(float(row["rr_released"]), 6),
             "tonder_commission": round(float(row["tonder_commission"]), 6),
@@ -388,7 +413,10 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
                 if not detail_df.empty and detail_df["merchant_name"].astype(str).str.strip().ne("").any():
                     detail_norm = detail_df["merchant_name"].map(_norm_text)
                     detail_is_tonder = detail_norm == "tonder"
-                    detail_df["rr_released_total"] = detail_df["rr_released"] + (detail_is_tonder.astype(float) * detail_df["net_deposit"])
+                    detail_tonder_release = detail_is_tonder.astype(float) * detail_df["net_deposit"]
+                    detail_df["rr_released_total"] = detail_df["rr_released"].where(
+                        detail_df["rr_released"] != 0, detail_tonder_release
+                    )
                     detail_df["rolling_reserve"] = detail_df["rr_retained"] - detail_df["rr_released_total"]
                     merchant_source = detail_df[~detail_is_tonder].copy()
         except Exception as exc:
@@ -402,6 +430,8 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
                 tx_count=("tx_count", "sum"),
                 gross_amount=("gross_amount", "sum"),
                 commission=("commission", "sum"),
+                kushki_commission=("kushki_commission", "sum"),
+                iva_kushki_commission=("iva_kushki_commission", "sum"),
                 rr_retained=("rr_retained", "sum"),
                 rr_released=("rr_released_total", "sum"),
                 tonder_commission=("tonder_commission", "sum"),
@@ -416,6 +446,8 @@ def parse_kushki(content: bytes, filename: str) -> Dict[str, Any]:
                 "tx_count": int(round(float(row["tx_count"]), 0)),
                 "gross_amount": round(float(row["gross_amount"]), 6),
                 "commission": round(float(row["commission"]), 6),
+                "kushki_commission": round(float(row["kushki_commission"]), 6),
+                "iva_kushki_commission": round(float(row["iva_kushki_commission"]), 6),
                 "rr_retained": round(float(row["rr_retained"]), 6),
                 "rr_released": round(float(row["rr_released"]), 6),
                 "tonder_commission": round(float(row["tonder_commission"]), 6),
@@ -441,6 +473,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "tx_count": 0.0,
         "gross_amount": 0.0,
         "commission": 0.0,
+        "kushki_commission": 0.0,
+        "iva_kushki_commission": 0.0,
         "rr_retained": 0.0,
         "rr_released": 0.0,
         "tonder_commission": 0.0,
@@ -452,6 +486,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "tx_count": 0.0,
         "gross_amount": 0.0,
         "commission": 0.0,
+        "kushki_commission": 0.0,
+        "iva_kushki_commission": 0.0,
         "rr_retained": 0.0,
         "rr_released": 0.0,
         "tonder_commission": 0.0,
@@ -467,6 +503,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             daily_acc[day]["tx_count"] += float(row.get("tx_count", 0) or 0)
             daily_acc[day]["gross_amount"] += float(row.get("gross_amount", 0) or 0)
             daily_acc[day]["commission"] += float(row.get("commission", 0) or 0)
+            daily_acc[day]["kushki_commission"] += float(row.get("kushki_commission", 0) or 0)
+            daily_acc[day]["iva_kushki_commission"] += float(row.get("iva_kushki_commission", 0) or 0)
             daily_acc[day]["rr_retained"] += float(row.get("rr_retained", 0) or 0)
             daily_acc[day]["rr_released"] += float(row.get("rr_released", 0) or 0)
             daily_acc[day]["tonder_commission"] += float(row.get("tonder_commission", 0) or 0)
@@ -483,6 +521,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             merchant_acc[key]["tx_count"] += float(row.get("tx_count", 0) or 0)
             merchant_acc[key]["gross_amount"] += float(row.get("gross_amount", 0) or 0)
             merchant_acc[key]["commission"] += float(row.get("commission", 0) or 0)
+            merchant_acc[key]["kushki_commission"] += float(row.get("kushki_commission", 0) or 0)
+            merchant_acc[key]["iva_kushki_commission"] += float(row.get("iva_kushki_commission", 0) or 0)
             merchant_acc[key]["rr_retained"] += float(row.get("rr_retained", 0) or 0)
             merchant_acc[key]["rr_released"] += float(row.get("rr_released", 0) or 0)
             merchant_acc[key]["tonder_commission"] += float(row.get("tonder_commission", 0) or 0)
@@ -496,6 +536,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "tx_count": int(round(data["tx_count"], 0)),
             "gross_amount": round(data["gross_amount"], 6),
             "commission": round(data["commission"], 6),
+            "kushki_commission": round(data["kushki_commission"], 6),
+            "iva_kushki_commission": round(data["iva_kushki_commission"], 6),
             "rr_retained": round(data["rr_retained"], 6),
             "rr_released": round(data["rr_released"], 6),
             "tonder_commission": round(data["tonder_commission"], 6),
@@ -512,6 +554,8 @@ def merge_kushki_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "tx_count": int(round(data["tx_count"], 0)),
             "gross_amount": round(data["gross_amount"], 6),
             "commission": round(data["commission"], 6),
+            "kushki_commission": round(data["kushki_commission"], 6),
+            "iva_kushki_commission": round(data["iva_kushki_commission"], 6),
             "rr_retained": round(data["rr_retained"], 6),
             "rr_released": round(data["rr_released"], 6),
             "tonder_commission": round(data["tonder_commission"], 6),

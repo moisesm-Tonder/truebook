@@ -427,8 +427,17 @@ def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
 
     for row in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
         gross = round(_num(row.get("gross_amount")), 6)
-        commission = round(_num(row.get("commission")), 6)
-        iva = round(_num(row.get("iva_kushki_commission")) or commission * 0.16, 6)
+        commission_total = round(_num(row.get("commission")), 6)
+        commission = round(_num(row.get("kushki_commission")), 6)
+        iva = round(_num(row.get("iva_kushki_commission")), 6)
+        # Backward-compatible split for historical runs where only total commission existed.
+        if commission == 0 and iva == 0 and commission_total != 0:
+            commission = round(commission_total / 1.16, 6)
+            iva = round(commission_total - commission, 6)
+        elif commission == 0 and commission_total != 0:
+            commission = round(max(commission_total - iva, 0), 6)
+        elif iva == 0 and commission_total != 0:
+            iva = round(max(commission_total - commission, 0), 6)
         rolling = round(_num(row.get("rolling_reserve")), 6)
         rr_retained = round(_num(row.get("rr_retained")), 6)
         rr_released = round(_num(row.get("rr_released")), 6)
