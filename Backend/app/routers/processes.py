@@ -2,7 +2,7 @@ import logging
 import os
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import List
+from typing import Dict, List, Optional
 from app.database import get_db
 from app.config import settings
 from app.core.deps import get_current_user
@@ -26,6 +26,49 @@ def _set_stage(db: Session, process: AccountingProcess, stage: str, progress: in
     process.current_stage = stage
     process.progress = progress
     db.commit()
+
+
+def _attach_conciliation_meta(proc: AccountingProcess, kvb: Optional[ConciliationResult]) -> AccountingProcess:
+    """
+    Add lightweight conciliation status fields used by list/dashboard UI.
+    """
+    # Defaults while process is not completed.
+    percent = 0.0
+    state = "processing"
+    message = "Pendiente de conciliación"
+
+    if proc.status == "failed":
+        state = "warning"
+        message = "Proceso con error"
+    elif proc.status == "completed":
+        if kvb is None:
+            state = "warning"
+            message = "Sin conciliación Kushki vs Banregio"
+        else:
+            matched = len(kvb.matched or [])
+            differences = len(kvb.differences or [])
+            unmatched_k = len(kvb.unmatched_kushki or [])
+            unmatched_b = len(kvb.unmatched_banregio or [])
+            total = matched + differences + unmatched_k + unmatched_b
+            issues = differences + unmatched_k + unmatched_b
+
+            if total > 0:
+                percent = round((matched * 100.0) / total, 2)
+            else:
+                percent = 0.0
+
+            if issues == 0 and total > 0:
+                state = "success"
+                message = "Conciliación al 100%"
+                percent = 100.0
+            else:
+                state = "warning"
+                message = f"Validando {issues} diferencia(s)"
+
+    setattr(proc, "conciliation_percent", percent)
+    setattr(proc, "conciliation_state", state)
+    setattr(proc, "conciliation_message", message)
+    return proc
 
 
 @router.get("/config")
@@ -54,7 +97,27 @@ def create_process(
 
 @router.get("/", response_model=List[ProcessOut])
 def list_processes(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(AccountingProcess).order_by(AccountingProcess.created_at.desc()).all()
+    processes = db.query(AccountingProcess).order_by(AccountingProcess.created_at.desc()).all()
+    if not processes:
+        return []
+
+    process_ids = [p.id for p in processes]
+    kvb_rows = (
+        db.query(ConciliationResult)
+        .filter(
+            ConciliationResult.process_id.in_(process_ids),
+            ConciliationResult.conciliation_type == "kushki_vs_banregio",
+        )
+        .all()
+    )
+
+    latest_kvb_by_process: Dict[int, ConciliationResult] = {}
+    for row in kvb_rows:
+        current = latest_kvb_by_process.get(row.process_id)
+        if current is None or (row.id or 0) > (current.id or 0):
+            latest_kvb_by_process[row.process_id] = row
+
+    return [_attach_conciliation_meta(proc, latest_kvb_by_process.get(proc.id)) for proc in processes]
 
 
 @router.get("/{process_id}", response_model=ProcessOut)
@@ -62,7 +125,16 @@ def get_process(process_id: int, db: Session = Depends(get_db), current_user: Us
     proc = db.query(AccountingProcess).filter(AccountingProcess.id == process_id).first()
     if not proc:
         raise HTTPException(status_code=404, detail="Process not found")
-    return proc
+    kvb = (
+        db.query(ConciliationResult)
+        .filter(
+            ConciliationResult.process_id == process_id,
+            ConciliationResult.conciliation_type == "kushki_vs_banregio",
+        )
+        .order_by(ConciliationResult.id.desc())
+        .first()
+    )
+    return _attach_conciliation_meta(proc, kvb)
 
 
 @router.delete("/{process_id}")
@@ -266,7 +338,11 @@ def _run_full_process(process_id: int):
         )
 
         if kushki_files:
-            from app.services.kushki_parser import parse_kushki, merge_kushki_results
+            from app.services.kushki_parser import (
+                enrich_kushki_with_fees,
+                merge_kushki_results,
+                parse_kushki,
+            )
             parsed_results = []
             for f in kushki_files:
                 _log(db, process_id, "kushki", f"Parseando {f.original_name}...")
@@ -283,6 +359,12 @@ def _run_full_process(process_id: int):
 
             if parsed_results:
                 kushki_data = merge_kushki_results(parsed_results)
+                kushki_data = enrich_kushki_with_fees(
+                    kushki_data,
+                    fees_data=fees_data,
+                    period_year=year,
+                    period_month=month,
+                )
                 existing = db.query(KushkiResult).filter(KushkiResult.process_id == process_id).first()
                 if existing:
                     db.delete(existing)

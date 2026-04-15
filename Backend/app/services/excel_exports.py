@@ -400,134 +400,340 @@ def build_fees_export(process, fees_result) -> Tuple[str, bytes]:
 
 def build_kushki_export(process, kushki_result) -> Tuple[str, bytes]:
     period_text = f"{_month_name_upper(process.period_month)} {process.period_year}"
-    daily_summary = kushki_result.daily_summary or []
-    merchant_detail = kushki_result.merchant_detail or []
+    daily_summary = sorted((kushki_result.daily_summary or []), key=lambda r: _date_label(r.get("date")))
+    merchant_detail = sorted(
+        (kushki_result.merchant_detail or []),
+        key=lambda r: (_date_label(r.get("date")), _safe_str(r.get("merchant_name"), "").lower()),
+    )
 
     wb = Workbook()
-    ws_daily = wb.active
-    ws_daily.title = "Resumen Diario"
-    ws_detail = wb.create_sheet("Detalle por Merchant")
+    ws_detail = wb.active
+    ws_detail.title = "Detalle por Merchant"
+    ws_daily = wb.create_sheet("Resumen Diario")
     ws_pivot = wb.create_sheet("Pivot por Merchant")
 
-    ws_daily["A1"] = f"KUSHKI — RESUMEN DIARIO DE LIQUIDACIONES · {period_text}"
-    daily_headers = [
-        "Fecha Liq.",
-        "# Txns",
-        "Monto Bruto",
-        "Comisión Kushki",
-        "IVA Kushki",
-        "RR Retenido",
-        "RR Liberado",
-        "Com. Tonder s/IVA",
-        "Ajustes",
-        "Depósito Neto (Abonar)",
-    ]
-    ws_daily.append(daily_headers)
-    _styled_header_row(ws_daily, 2, 1, len(daily_headers))
+    teal = "1A7A6E"
+    teal_light = "E8F4F2"
+    teal_med = "A8D5CF"
+    teal_dark = "145F55"
 
-    for row in sorted(daily_summary, key=lambda r: _date_label(r.get("date"))):
-        gross = round(_num(row.get("gross_amount")), 6)
-        commission_total = round(_num(row.get("commission")), 6)
-        commission = round(_num(row.get("kushki_commission")), 6)
-        iva = round(_num(row.get("iva_kushki_commission")), 6)
-        # Backward-compatible split for historical runs where only total commission existed.
-        if commission == 0 and iva == 0 and commission_total != 0:
-            commission = round(commission_total / 1.16, 6)
-            iva = round(commission_total - commission, 6)
-        elif commission == 0 and commission_total != 0:
-            commission = round(max(commission_total - iva, 0), 6)
-        elif iva == 0 and commission_total != 0:
-            iva = round(max(commission_total - commission, 0), 6)
-        rolling = round(_num(row.get("rolling_reserve")), 6)
-        rr_retained = round(_num(row.get("rr_retained")), 6)
-        rr_released = round(_num(row.get("rr_released")), 6)
-        if rr_retained == 0 and rr_released == 0 and rolling != 0:
-            if rolling > 0:
-                rr_retained = rolling
-            else:
-                rr_released = abs(rolling)
-        tonder_commission = round(_num(row.get("tonder_commission")), 6)
-        adjustments = round(_num(row.get("adjustments")), 6)
-        net = round(_num(row.get("net_deposit")), 6)
-        ws_daily.append([
-            _date_label(row.get("date")),
-            int(_num(row.get("tx_count"))),
-            gross,
-            commission,
-            iva,
-            rr_retained,
-            rr_released,
-            tonder_commission,
-            adjustments,
-            net,
-        ])
+    def style_header(ws, row_idx: int, start_col: int, end_col: int):
+        for col in range(start_col, end_col + 1):
+            cell = ws.cell(row=row_idx, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=teal)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    def style_total(ws, row_idx: int, start_col: int, end_col: int):
+        for col in range(start_col, end_col + 1):
+            cell = ws.cell(row=row_idx, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=teal_dark)
+
+    def style_block_header(ws, row_idx: int):
+        for col in range(1, 20):
+            cell = ws.cell(row=row_idx, column=col)
+            cell.font = Font(bold=True, color="0F172A")
+            cell.fill = PatternFill("solid", fgColor=teal_med)
+
+    def apply_number_formats(ws, start_row: int, end_row: int, count_cols: List[int], amount_cols: List[int], pct_cols: List[int]):
+        for r in range(start_row, end_row + 1):
+            for c in count_cols:
+                ws.cell(row=r, column=c).number_format = "#,##0"
+            for c in amount_cols:
+                ws.cell(row=r, column=c).number_format = "#,##0.00"
+            for c in pct_cols:
+                ws.cell(row=r, column=c).number_format = "0.00%"
+
+    daily_by_date = {str(row.get("date", "")): row for row in daily_summary}
+    merchant_by_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in merchant_detail:
+        merchant_by_date[str(row.get("date", ""))].append(row)
+
+    # ---- Detalle por Merchant ----
     ws_detail["A1"] = f"KUSHKI — DETALLE POR MERCHANT · {period_text}"
+    ws_detail["A2"] = "Montos en MXN | Estructura contable por liquidación (settlement)"
     detail_headers = [
         "Fecha Liq.",
         "Merchant",
         "# Txns",
-        "Monto Bruto",
+        "Monto Bruto (Kushki)",
+        "Bruto Ajustes",
+        "Com. Kushki",
+        "IVA Kushki",
         "Com. Kushki + IVA",
-        "Rolling Reserve",
+        "RR Retenido",
+        "Devolución (REFUND)",
+        "Contracargo (CHARGEBACK)",
+        "Cancelación (VOID)",
+        "Manual (MANUAL)",
         "RR Liberado",
-        "Com. Tonder %",
-        "Depósito Neto Merchant",
+        "Depósito Neto (Monto Abonar)",
+        "Com. Tonder s/IVA",
+        "IVA (16%)",
+        "Com. Tonder c/IVA",
+        "Verificación",
     ]
     ws_detail.append(detail_headers)
-    _styled_header_row(ws_detail, 2, 1, len(detail_headers))
+    style_header(ws_detail, 3, 1, len(detail_headers))
+    ws_detail.freeze_panes = "A4"
 
-    for row in sorted(merchant_detail, key=lambda r: (_date_label(r.get("date")), _safe_str(r.get("merchant_name"), ""))):
-        rolling = round(_num(row.get("rolling_reserve")), 6)
-        rr_retained = round(_num(row.get("rr_retained")), 6)
-        rr_released = round(_num(row.get("rr_released")), 6)
-        if rr_retained == 0 and rr_released == 0 and rolling != 0:
-            if rolling > 0:
-                rr_retained = rolling
-            else:
-                rr_released = abs(rolling)
-        ws_detail.append([
-            _date_label(row.get("date")) or f"{process.period_year}-{str(process.period_month).zfill(2)}",
-            _safe_str(row.get("merchant_name"), "unknown"),
+    first_detail_data_row = None
+    last_detail_data_row = None
+
+    for idx, liq_date in enumerate(sorted(set(list(daily_by_date.keys()) + list(merchant_by_date.keys())))):
+        if not liq_date:
+            continue
+        daily = daily_by_date.get(liq_date, {})
+        dep_total = round(_num(daily.get("net_deposit")), 6)
+
+        ws_detail.append([f"Liquidación {liq_date} | Depósito Banregio esperado: ${dep_total:,.2f}"])
+        block_row = ws_detail.max_row
+        ws_detail.merge_cells(start_row=block_row, start_column=1, end_row=block_row, end_column=19)
+        style_block_header(ws_detail, block_row)
+
+        merchant_rows = merchant_by_date.get(liq_date, [])
+        merchant_rr_total = 0.0
+        for row in merchant_rows:
+            rr_released = round(_num(row.get("rr_released")), 6)
+            merchant_rr_total += rr_released
+            ws_detail.append([
+                liq_date,
+                _safe_str(row.get("merchant_name"), "unknown"),
+                int(_num(row.get("tx_count"))),
+                round(_num(row.get("gross_amount")), 6),
+                round(_num(row.get("gross_adjustments")), 6),
+                round(_num(row.get("kushki_commission")), 6),
+                round(_num(row.get("iva_kushki_commission")), 6),
+                round(_num(row.get("commission")), 6),
+                round(_num(row.get("rr_retained")), 6),
+                round(_num(row.get("refund")), 6),
+                round(_num(row.get("chargeback")), 6),
+                round(_num(row.get("void")), 6),
+                round(_num(row.get("manual")), 6),
+                rr_released,
+                round(_num(row.get("net_deposit")), 6),
+                round(_num(row.get("tonder_commission")), 6),
+                round(_num(row.get("tonder_iva")), 6),
+                round(_num(row.get("tonder_total")), 6),
+                round(_num(row.get("net_deposit")), 6),
+            ])
+            current_row = ws_detail.max_row
+            if first_detail_data_row is None:
+                first_detail_data_row = current_row
+            last_detail_data_row = current_row
+            if (idx + current_row) % 2 == 0:
+                for col in range(1, 20):
+                    ws_detail.cell(row=current_row, column=col).fill = PatternFill("solid", fgColor=teal_light)
+
+        rr_released_daily = round(_num(daily.get("rr_released")), 6)
+        rr_released_extra = round(rr_released_daily - merchant_rr_total, 6)
+        if abs(rr_released_extra) > 0.01:
+            ws_detail.append([
+                liq_date,
+                "RR Liberado (Ajuste de bloque)",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rr_released_extra,
+                rr_released_extra,
+                None,
+                None,
+                None,
+                rr_released_extra,
+            ])
+            current_row = ws_detail.max_row
+            if first_detail_data_row is None:
+                first_detail_data_row = current_row
+            last_detail_data_row = current_row
+
+        ws_detail.append([])
+
+    ws_detail.append(["TOTAL"])
+    detail_total_row = ws_detail.max_row
+    if first_detail_data_row and last_detail_data_row:
+        for col in range(3, 20):
+            col_letter = get_column_letter(col)
+            ws_detail.cell(
+                row=detail_total_row,
+                column=col,
+                value=f"=SUM({col_letter}{first_detail_data_row}:{col_letter}{last_detail_data_row})",
+            )
+    style_total(ws_detail, detail_total_row, 1, 19)
+
+    # ---- Resumen Diario ----
+    ws_daily["A1"] = f"KUSHKI — RESUMEN DIARIO DE LIQUIDACIONES · {period_text}"
+    daily_headers = [
+        "Fecha Liq.",
+        "# Txns",
+        "Monto Bruto (Kushki)",
+        "Bruto Ajustes",
+        "Com. Kushki + IVA",
+        "RR Retenido",
+        "Devolución (REFUND)",
+        "Contracargo (CHARGEBACK)",
+        "Cancelación (VOID)",
+        "Manual (MANUAL)",
+        "RR Liberado",
+        "Depósito Neto",
+        "Com. Tonder s/IVA",
+        "IVA (16%)",
+        "Com. Tonder c/IVA",
+    ]
+    ws_daily.append(daily_headers)
+    style_header(ws_daily, 2, 1, len(daily_headers))
+    ws_daily.freeze_panes = "A3"
+
+    daily_start_row = ws_daily.max_row + 1
+    for row in daily_summary:
+        ws_daily.append([
+            _date_label(row.get("date")),
             int(_num(row.get("tx_count"))),
             round(_num(row.get("gross_amount")), 6),
+            round(_num(row.get("gross_adjustments")), 6),
             round(_num(row.get("commission")), 6),
-            rr_retained,
-            rr_released,
-            round(_num(row.get("tonder_commission")), 6),
+            round(_num(row.get("rr_retained")), 6),
+            round(_num(row.get("refund")), 6),
+            round(_num(row.get("chargeback")), 6),
+            round(_num(row.get("void")), 6),
+            round(_num(row.get("manual")), 6),
+            round(_num(row.get("rr_released")), 6),
             round(_num(row.get("net_deposit")), 6),
+            round(_num(row.get("tonder_commission")), 6),
+            round(_num(row.get("tonder_iva")), 6),
+            round(_num(row.get("tonder_total")), 6),
         ])
 
-    ws_pivot["A1"] = f"KUSHKI — ACUMULADO POR MERCHANT · {period_text}"
-    pivot_headers = ["Merchant", "# Txns", "Monto Bruto", "Com. Kushki + IVA", "Tasa Efectiva", "Depósito Neto"]
-    ws_pivot.append(pivot_headers)
-    _styled_header_row(ws_pivot, 2, 1, len(pivot_headers))
+    ws_daily.append(["TOTAL"])
+    daily_total_row = ws_daily.max_row
+    if ws_daily.max_row > daily_start_row:
+        for col in range(2, 16):
+            col_letter = get_column_letter(col)
+            ws_daily.cell(
+                row=daily_total_row,
+                column=col,
+                value=f"=SUM({col_letter}{daily_start_row}:{col_letter}{daily_total_row - 1})",
+            )
+    style_total(ws_daily, daily_total_row, 1, 15)
 
-    pivot_acc = defaultdict(lambda: {"tx_count": 0.0, "gross_amount": 0.0, "commission": 0.0, "net_deposit": 0.0})
+    # ---- Pivot por Merchant ----
+    ws_pivot["A1"] = f"KUSHKI — ACUMULADO POR MERCHANT · {period_text}"
+    pivot_headers = [
+        "Merchant",
+        "# Txns",
+        "Monto Bruto (Kushki)",
+        "Com. Kushki + IVA",
+        "RR Retenido",
+        "Tasa Efectiva",
+        "Ajuste Total",
+        "Depósito Neto",
+    ]
+    ws_pivot.append(pivot_headers)
+    style_header(ws_pivot, 2, 1, len(pivot_headers))
+    ws_pivot.freeze_panes = "A3"
+
+    pivot_acc = defaultdict(
+        lambda: {
+            "tx_count": 0.0,
+            "gross_amount": 0.0,
+            "commission": 0.0,
+            "rr_retained": 0.0,
+            "adjustment_total": 0.0,
+            "net_deposit": 0.0,
+        }
+    )
     for row in merchant_detail:
         merchant = _safe_str(row.get("merchant_name"), "unknown")
         pivot_acc[merchant]["tx_count"] += _num(row.get("tx_count"))
         pivot_acc[merchant]["gross_amount"] += _num(row.get("gross_amount"))
         pivot_acc[merchant]["commission"] += _num(row.get("commission"))
+        pivot_acc[merchant]["rr_retained"] += _num(row.get("rr_retained"))
+        pivot_acc[merchant]["adjustment_total"] += (
+            _num(row.get("refund"))
+            + _num(row.get("chargeback"))
+            + _num(row.get("void"))
+            + _num(row.get("manual"))
+            + _num(row.get("rr_released"))
+        )
         pivot_acc[merchant]["net_deposit"] += _num(row.get("net_deposit"))
 
+    pivot_start_row = ws_pivot.max_row + 1
     for merchant, row in sorted(pivot_acc.items(), key=lambda x: x[0].lower()):
         gross = round(_num(row.get("gross_amount")), 6)
         commission = round(_num(row.get("commission")), 6)
-        tasa = round((commission / gross) if gross else 0.0, 12)
+        tasa = (commission / gross) if gross else 0.0
         ws_pivot.append([
             merchant,
             int(_num(row.get("tx_count"))),
             gross,
             commission,
+            round(_num(row.get("rr_retained")), 6),
             tasa,
+            round(_num(row.get("adjustment_total")), 6),
             round(_num(row.get("net_deposit")), 6),
         ])
 
-    for ws in [ws_daily, ws_detail, ws_pivot]:
-        _autowidth(ws)
+    ws_pivot.append(["TOTAL"])
+    pivot_total_row = ws_pivot.max_row
+    if ws_pivot.max_row > pivot_start_row:
+        for col in [2, 3, 4, 5, 7, 8]:
+            col_letter = get_column_letter(col)
+            ws_pivot.cell(
+                row=pivot_total_row,
+                column=col,
+                value=f"=SUM({col_letter}{pivot_start_row}:{col_letter}{pivot_total_row - 1})",
+            )
+    style_total(ws_pivot, pivot_total_row, 1, 8)
 
-    filename = f"KUSHKI_{_month_name_upper(process.period_month)}_{process.period_year}_v3.xlsx"
+    # Column widths (spec-recommended)
+    detail_widths = [12, 26, 8, 16, 14, 12, 12, 14, 13, 13, 15, 13, 11, 13, 16, 15, 13, 15, 13]
+    daily_widths = [12, 10, 16, 14, 16, 13, 14, 16, 13, 11, 13, 15, 15, 13, 15]
+    pivot_widths = [28, 10, 18, 16, 14, 14, 14, 16]
+    for idx, width in enumerate(detail_widths, start=1):
+        ws_detail.column_dimensions[get_column_letter(idx)].width = width
+    for idx, width in enumerate(daily_widths, start=1):
+        ws_daily.column_dimensions[get_column_letter(idx)].width = width
+    for idx, width in enumerate(pivot_widths, start=1):
+        ws_pivot.column_dimensions[get_column_letter(idx)].width = width
+
+    # Number formatting
+    if first_detail_data_row and detail_total_row >= first_detail_data_row:
+        apply_number_formats(
+            ws_detail,
+            start_row=first_detail_data_row,
+            end_row=detail_total_row,
+            count_cols=[3],
+            amount_cols=list(range(4, 20)),
+            pct_cols=[],
+        )
+    if daily_start_row and daily_total_row >= daily_start_row:
+        apply_number_formats(
+            ws_daily,
+            start_row=daily_start_row,
+            end_row=daily_total_row,
+            count_cols=[2],
+            amount_cols=list(range(3, 16)),
+            pct_cols=[],
+        )
+    if pivot_start_row and pivot_total_row >= pivot_start_row:
+        apply_number_formats(
+            ws_pivot,
+            start_row=pivot_start_row,
+            end_row=pivot_total_row,
+            count_cols=[2],
+            amount_cols=[3, 4, 5, 7, 8],
+            pct_cols=[6],
+        )
+
+    filename = f"KUSHKI_{_month_name_upper(process.period_month)}_{process.period_year}_v4.xlsx"
     return filename, _save_workbook(wb)
 
 

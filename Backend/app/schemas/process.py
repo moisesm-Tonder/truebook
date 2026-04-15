@@ -19,6 +19,9 @@ class ProcessOut(BaseModel):
     status: str
     current_stage: Optional[str]
     progress: int
+    conciliation_percent: Optional[float] = None
+    conciliation_state: Optional[str] = None
+    conciliation_message: Optional[str] = None
     created_by: Optional[int]
     created_at: datetime
     updated_at: Optional[datetime]

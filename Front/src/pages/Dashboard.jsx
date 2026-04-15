@@ -5,7 +5,7 @@ import { processApi } from '../api/client'
 import {
   Activity, Plus, CheckCircle2, XCircle, Loader2,
   TrendingUp, ArrowRight, Calendar, Clock,
-  BarChart3, Layers,
+  BarChart3, Layers, AlertTriangle,
 } from 'lucide-react'
 import StatusBadge from '../components/ui/StatusBadge'
 import { TonderWordmark } from '../components/ui/TonderLogo'
@@ -21,6 +21,45 @@ const MONTH_NAMES = [
   'Ene','Feb','Mar','Abr','May','Jun',
   'Jul','Ago','Sep','Oct','Nov','Dic'
 ]
+
+function getConciliationView(process) {
+  const parsedPercent = Number(process?.conciliation_percent)
+  const fallback = process?.status === 'completed'
+    ? 0
+    : Number(process?.progress || 0)
+  const percent = Number.isFinite(parsedPercent)
+    ? Math.max(0, Math.min(100, parsedPercent))
+    : Math.max(0, Math.min(100, fallback))
+
+  const state = process?.conciliation_state || (
+    process?.status === 'completed'
+      ? (percent >= 100 ? 'success' : 'warning')
+      : 'processing'
+  )
+  const message = process?.conciliation_message || (
+    state === 'success'
+      ? 'Conciliado'
+      : state === 'warning'
+      ? 'Validando conciliación'
+      : 'En proceso'
+  )
+
+  const barColor = state === 'success'
+    ? '#10b981'
+    : state === 'warning'
+    ? '#fbbf24'
+    : 'linear-gradient(90deg, #375DFB, #818cf8)'
+
+  const textColor = state === 'success'
+    ? '#34d399'
+    : state === 'warning'
+    ? '#fbbf24'
+    : '#475569'
+
+  const percentLabel = Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`
+
+  return { percent, state, message, barColor, textColor, percentLabel }
+}
 
 function StatCard({ label, value, icon: Icon, color, sub }) {
   return (
@@ -309,7 +348,7 @@ export default function Dashboard() {
             <table className="w-full text-sm">
               <thead>
                 <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                  {['Nombre', 'Período', 'Estado', 'Progreso', 'Creado', ''].map(h => (
+                  {['Nombre', 'Período', 'Estado', 'Conciliación', 'Creado', ''].map(h => (
                     <th
                       key={h}
                       className="text-left px-6 py-3 text-xs font-semibold uppercase tracking-wider"
@@ -321,7 +360,9 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {recent.map((p, i) => (
+                {recent.map((p, i) => {
+                  const conc = getConciliationView(p)
+                  return (
                   <tr
                     key={p.id}
                     className="transition-colors table-row-hover"
@@ -343,26 +384,30 @@ export default function Dashboard() {
                       <StatusBadge status={p.status} />
                     </td>
                     <td className="px-6 py-3.5">
-                      <div className="flex items-center gap-2.5">
-                        <div
-                          className="w-24 h-1.5 rounded-full overflow-hidden"
-                          style={{ background: 'rgba(255,255,255,0.06)' }}
-                        >
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2.5">
                           <div
-                            className="h-full rounded-full transition-all duration-500"
-                            style={{
-                              width: `${p.progress}%`,
-                              background: p.status === 'failed'
-                                ? '#ef4444'
-                                : p.status === 'completed'
-                                ? '#10b981'
-                                : 'linear-gradient(90deg, #375DFB, #818cf8)',
-                            }}
-                          />
+                            className="w-24 h-1.5 rounded-full overflow-hidden"
+                            style={{ background: 'rgba(255,255,255,0.06)' }}
+                          >
+                            <div
+                              className="h-full rounded-full transition-all duration-500"
+                              style={{
+                                width: `${conc.percent}%`,
+                                background: conc.barColor,
+                              }}
+                            />
+                          </div>
+                          <span className="text-xs font-medium" style={{ color: conc.textColor }}>
+                            {conc.percentLabel}
+                          </span>
                         </div>
-                        <span className="text-xs font-medium" style={{ color: '#475569' }}>
-                          {p.progress}%
-                        </span>
+                        {conc.state === 'warning' && (
+                          <div className="flex items-center gap-1 text-[11px]" style={{ color: '#fbbf24' }}>
+                            <AlertTriangle size={11} />
+                            <span>{conc.message}</span>
+                          </div>
+                        )}
                       </div>
                     </td>
                     <td className="px-6 py-3.5">
@@ -383,7 +428,7 @@ export default function Dashboard() {
                       </Link>
                     </td>
                   </tr>
-                ))}
+                )})}
               </tbody>
             </table>
           )}

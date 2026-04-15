@@ -119,7 +119,8 @@ def conciliate_fees(fees_result: Dict[str, Any]) -> Dict[str, Any]:
 def conciliate_kushki_daily(kushki_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate Kushki daily summary:
-    gross - commission - rolling_reserve = net_deposit per day.
+    Dep Neto = Bruto + Bruto Ajustes - Comision - RR Retenido
+             + REFUND + CHARGEBACK + VOID + MANUAL + RR Liberado
     """
     daily = kushki_result.get("daily_summary", [])
     matched = []
@@ -127,17 +128,42 @@ def conciliate_kushki_daily(kushki_result: Dict[str, Any]) -> Dict[str, Any]:
 
     for row in daily:
         gross = _to_float(row.get("gross_amount", 0))
+        gross_adjustments = _to_float(row.get("gross_adjustments", 0))
         commission = _to_float(row.get("commission", 0))
-        rolling = _to_float(row.get("rolling_reserve", 0))
+        rr_retained = _to_float(row.get("rr_retained", 0))
+        rr_released = _to_float(row.get("rr_released", 0))
+        refund = _to_float(row.get("refund", 0))
+        chargeback = _to_float(row.get("chargeback", 0))
+        void = _to_float(row.get("void", 0))
+        manual = _to_float(row.get("manual", 0))
+        rolling = _to_float(row.get("rolling_reserve", rr_retained - rr_released))
         net = _to_float(row.get("net_deposit", 0))
-        computed_net = round(gross - commission - rolling, 6)
+        computed_net = round(
+            gross
+            + gross_adjustments
+            - commission
+            - rr_retained
+            + refund
+            + chargeback
+            + void
+            + manual
+            + rr_released,
+            6,
+        )
         diff = round(abs(computed_net - net), 6)
 
         entry = {
             "date": row.get("date"),
             "tx_count": row.get("tx_count"),
             "gross_amount": gross,
+            "gross_adjustments": gross_adjustments,
             "commission": commission,
+            "rr_retained": rr_retained,
+            "rr_released": rr_released,
+            "refund": refund,
+            "chargeback": chargeback,
+            "void": void,
+            "manual": manual,
             "rolling_reserve": rolling,
             "net_deposit": net,
             "computed_net": computed_net,

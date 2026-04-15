@@ -2,10 +2,49 @@ import React, { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { processApi } from '../api/client'
-import { Plus, Loader2, Trash2 } from 'lucide-react'
+import { Plus, Loader2, Trash2, AlertTriangle } from 'lucide-react'
 import StatusBadge from '../components/ui/StatusBadge'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
+
+function getConciliationView(process) {
+  const parsedPercent = Number(process?.conciliation_percent)
+  const fallback = process?.status === 'completed'
+    ? 0
+    : Number(process?.progress || 0)
+  const percent = Number.isFinite(parsedPercent)
+    ? Math.max(0, Math.min(100, parsedPercent))
+    : Math.max(0, Math.min(100, fallback))
+
+  const state = process?.conciliation_state || (
+    process?.status === 'completed'
+      ? (percent >= 100 ? 'success' : 'warning')
+      : 'processing'
+  )
+  const message = process?.conciliation_message || (
+    state === 'success'
+      ? 'Conciliado'
+      : state === 'warning'
+      ? 'Validando conciliación'
+      : 'En proceso'
+  )
+
+  const barClass = state === 'success'
+    ? 'bg-emerald-500'
+    : state === 'warning'
+    ? 'bg-amber-400'
+    : 'bg-brand-500'
+
+  const textClass = state === 'success'
+    ? 'text-emerald-400'
+    : state === 'warning'
+    ? 'text-amber-400'
+    : 'text-slate-400'
+
+  const percentLabel = Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`
+
+  return { percent, state, message, barClass, textClass, percentLabel }
+}
 
 export default function ProcessList() {
   const qc = useQueryClient()
@@ -51,13 +90,15 @@ export default function ProcessList() {
           <table className="w-full text-sm">
             <thead className="border-b border-slate-800 bg-slate-900/50">
               <tr>
-                {['ID', 'Nombre', 'Período', 'Adquirentes', 'Estado', 'Progreso', 'Creado', ''].map(h => (
+                {['ID', 'Nombre', 'Período', 'Adquirentes', 'Estado', 'Conciliación', 'Creado', ''].map(h => (
                   <th key={h} className="text-left px-5 py-3 text-slate-400 font-medium">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {processes.map(p => (
+              {processes.map(p => {
+                const conc = getConciliationView(p)
+                return (
                 <tr key={p.id} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
                   <td className="px-5 py-3 text-slate-500">#{p.id}</td>
                   <td className="px-5 py-3 text-slate-200 font-medium">{p.name}</td>
@@ -75,14 +116,22 @@ export default function ProcessList() {
                   </td>
                   <td className="px-5 py-3"><StatusBadge status={p.status} /></td>
                   <td className="px-5 py-3">
-                    <div className="flex items-center gap-2">
-                      <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-brand-500 rounded-full"
-                          style={{ width: `${p.progress}%` }}
-                        />
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full ${conc.barClass}`}
+                            style={{ width: `${conc.percent}%` }}
+                          />
+                        </div>
+                        <span className={`text-xs ${conc.textClass}`}>{conc.percentLabel}</span>
                       </div>
-                      <span className="text-xs text-slate-400">{p.progress}%</span>
+                      {conc.state === 'warning' && (
+                        <div className="flex items-center gap-1 text-[11px] text-amber-400">
+                          <AlertTriangle size={11} />
+                          <span>{conc.message}</span>
+                        </div>
+                      )}
                     </div>
                   </td>
                   <td className="px-5 py-3 text-slate-500 text-xs">
@@ -123,7 +172,7 @@ export default function ProcessList() {
                     </div>
                   </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
           </table>
         )}
